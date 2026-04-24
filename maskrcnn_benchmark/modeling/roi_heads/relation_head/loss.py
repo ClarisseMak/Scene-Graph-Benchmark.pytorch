@@ -10,6 +10,11 @@ from maskrcnn_benchmark.modeling.box_coder import BoxCoder
 from maskrcnn_benchmark.modeling.matcher import Matcher
 from maskrcnn_benchmark.structures.boxlist_ops import boxlist_iou
 from maskrcnn_benchmark.modeling.utils import cat
+from maskrcnn_benchmark.data.datasets.style_tags import (
+    QWEN_STYLE_TAGS_V1,
+    STYLE_V2_EMPIRICAL_FREQ,
+    compute_inverse_freq_style_loss_weights,
+)
 
 class RelationLossComputation(object):
     """
@@ -26,6 +31,7 @@ class RelationLossComputation(object):
         attribute_bgfg_ratio,
         use_label_smoothing,
         predicate_proportion,
+        style_class_weights=None,
     ):
         """
         Arguments:
@@ -45,8 +51,15 @@ class RelationLossComputation(object):
         else:
             self.criterion_loss = nn.CrossEntropyLoss()
 
+        # CPU tensor; moved to logits.device in __call__ for style CE
+        self.style_class_weights = style_class_weights
+        if style_class_weights is None:
+            self.criterion_style = nn.CrossEntropyLoss(ignore_index=-1)
+        else:
+            self.criterion_style = None
 
-    def __call__(self, proposals, rel_labels, relation_logits, refine_logits):
+
+    def __call__(self, proposals, rel_labels, relation_logits, refine_logits, style_logits=None, style_labels=None):
         """
         Computes the loss for relation triplet.
         This requires that the subsample method has been called beforehand.
@@ -78,6 +91,23 @@ class RelationLossComputation(object):
         loss_relation = self.criterion_loss(relation_logits, rel_labels.long())
         loss_refine_obj = self.criterion_loss(refine_obj_logits, fg_labels.long())
 
+        loss_style = None
+        if style_logits is not None and style_labels is not None:
+            # style_logits: (batch_size, C), style_labels: (batch_size,) with -1 = ignore
+            if (style_labels >= 0).any():
+                if self.style_class_weights is None:
+                    loss_style = self.criterion_style(style_logits, style_labels.long())
+                else:
+                    w = self.style_class_weights.to(
+                        device=style_logits.device, dtype=style_logits.dtype
+                    )
+                    loss_style = F.cross_entropy(
+                        style_logits,
+                        style_labels.long(),
+                        weight=w,
+                        ignore_index=-1,
+                    )
+
         # The following code is used to calcaulate sampled attribute loss
         if self.attri_on:
             refine_att_logits = cat(refine_att_logits, dim=0)
@@ -95,9 +125,9 @@ class RelationLossComputation(object):
             loss_refine_att = self.attribute_loss(refine_att_logits, attribute_targets, 
                                              fg_bg_sample=self.attribute_sampling, 
                                              bg_fg_ratio=self.attribute_bgfg_ratio)
-            return loss_relation, (loss_refine_obj, loss_refine_att)
+            return loss_relation, (loss_refine_obj, loss_refine_att), loss_style
         else:
-            return loss_relation, loss_refine_obj
+            return loss_relation, loss_refine_obj, loss_style
 
     def generate_attributes_target(self, attributes):
         """
@@ -163,6 +193,22 @@ class FocalLoss(nn.Module):
 
 
 def make_roi_relation_loss_evaluator(cfg):
+    import logging
+
+    logger = logging.getLogger(__name__)
+    style_class_weights = None
+    if getattr(cfg.MODEL.ROI_RELATION_HEAD, "STYLE_LOSS_USE_CLASS_WEIGHTS", False):
+        style_class_weights = compute_inverse_freq_style_loss_weights(dtype=torch.float32)
+        wlist = [round(x, 4) for x in style_class_weights.tolist()]
+        logger.info("STYLE_LOSS_USE_CLASS_WEIGHTS: mean-normalized inverse-frequency weights: %s", wlist)
+        for i, name in enumerate(QWEN_STYLE_TAGS_V1):
+            logger.info(
+                "  style CE [%d] %-24s  weight=%.5f  prior_freq=%.5f",
+                i,
+                name[:24],
+                style_class_weights[i].item(),
+                STYLE_V2_EMPIRICAL_FREQ[i],
+            )
 
     loss_evaluator = RelationLossComputation(
         cfg.MODEL.ATTRIBUTE_ON,
@@ -172,6 +218,7 @@ def make_roi_relation_loss_evaluator(cfg):
         cfg.MODEL.ROI_ATTRIBUTE_HEAD.ATTRIBUTE_BGFG_RATIO,
         cfg.MODEL.ROI_RELATION_HEAD.LABEL_SMOOTHING_LOSS,
         cfg.MODEL.ROI_RELATION_HEAD.REL_PROP,
+        style_class_weights=style_class_weights,
     )
 
     return loss_evaluator

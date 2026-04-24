@@ -32,7 +32,9 @@ def get_dataset_statistics(cfg):
     DatasetCatalog = paths_catalog.DatasetCatalog
     dataset_names = cfg.DATASETS.TRAIN
 
-    data_statistics_name = ''.join(dataset_names) + '_statistics'
+    # Include predicate ontology so switching VG vs fashion_context does not load wrong pred_dist shape
+    pred_set = getattr(cfg.DATASETS, "PREDICATE_SET", "vg")
+    data_statistics_name = ''.join(dataset_names) + '_statistics_' + str(pred_set).replace('/', '_')
     save_file = os.path.join(cfg.OUTPUT_DIR, "{}.cache".format(data_statistics_name))
     
     if os.path.exists(save_file):
@@ -115,14 +117,42 @@ def build_dataset(cfg, dataset_list, transforms, dataset_catalog, is_train=True)
     return [dataset]
 
 
-def make_data_sampler(dataset, shuffle, distributed):
+def _style_weighted_sample_weights_list(dataset):
+    """Build per-index weights for WeightedRandomSampler, or None if unavailable / uniform."""
+    ds = dataset
+    if isinstance(ds, torch.utils.data.ConcatDataset):
+        if len(ds.datasets) != 1:
+            logging.getLogger(__name__).warning(
+                "ConcatDataset with multiple subsets: style weighted sampler uses the first subset only."
+            )
+        ds = ds.datasets[0]
+    if not hasattr(ds, "get_style_train_sample_weight"):
+        return None
+    weights = [ds.get_style_train_sample_weight(i) for i in range(len(ds))]
+    if not any(w != 1.0 for w in weights):
+        return None
+    return weights
+
+
+def make_data_sampler(dataset, shuffle, distributed, sample_weights=None):
+    logger = logging.getLogger(__name__)
     if distributed:
+        if sample_weights is not None:
+            logger.warning(
+                "train_sample_weight_by_image_id is ignored under distributed training (DistributedSampler). "
+                "Use single GPU or extend samplers for weighted distributed sampling."
+            )
         return samplers.DistributedSampler(dataset, shuffle=shuffle)
+    if shuffle and sample_weights is not None:
+        w = torch.as_tensor(sample_weights, dtype=torch.double)
+        return torch.utils.data.WeightedRandomSampler(
+            weights=w,
+            num_samples=len(w),
+            replacement=True,
+        )
     if shuffle:
-        sampler = torch.utils.data.sampler.RandomSampler(dataset)
-    else:
-        sampler = torch.utils.data.sampler.SequentialSampler(dataset)
-    return sampler
+        return torch.utils.data.sampler.RandomSampler(dataset)
+    return torch.utils.data.sampler.SequentialSampler(dataset)
 
 
 def _quantize(x, bins):
@@ -236,7 +266,14 @@ def make_data_loader(cfg, mode='train', is_distributed=False, start_iter=0, data
         # print(len(dataset))
         # print(images_per_gpu)
         # print('============')
-        sampler = make_data_sampler(dataset, shuffle, is_distributed)
+        sample_weights = None
+        if is_train and getattr(cfg.DATASETS, "STYLE_WEIGHTED_TRAIN_SAMPLER", False):
+            sample_weights = _style_weighted_sample_weights_list(dataset)
+            if sample_weights is not None:
+                logging.getLogger(__name__).info(
+                    "Using WeightedRandomSampler for style balance (non-uniform train_sample_weight_by_image_id)."
+                )
+        sampler = make_data_sampler(dataset, shuffle, is_distributed, sample_weights)
         batch_sampler = make_batch_data_sampler(
             dataset, sampler, aspect_grouping, images_per_gpu, num_iters, start_iter
         )

@@ -4,10 +4,11 @@
 from maskrcnn_benchmark.utils.env import setup_environment  # noqa F401 isort:skip
 
 import argparse
+import importlib.util
 import os
 
 import torch
-from maskrcnn_benchmark.config import cfg
+from maskrcnn_benchmark.config import cfg, coerce_yacs_cli_opts
 from maskrcnn_benchmark.data import make_data_loader
 from maskrcnn_benchmark.engine.inference import inference
 from maskrcnn_benchmark.modeling.detector import build_detection_model
@@ -16,12 +17,7 @@ from maskrcnn_benchmark.utils.collect_env import collect_env_info
 from maskrcnn_benchmark.utils.comm import synchronize, get_rank
 from maskrcnn_benchmark.utils.logger import setup_logger
 from maskrcnn_benchmark.utils.miscellaneous import mkdir
-
-# Check if we can enable mixed-precision via apex.amp
-try:
-    from apex import amp
-except ImportError:
-    raise ImportError('Use APEX for mixed precision via apex.amp')
+from maskrcnn_benchmark.utils.amp_compat import amp
 
 
 def main():
@@ -32,7 +28,7 @@ def main():
         metavar="FILE",
         help="path to config file",
     )
-    parser.add_argument("--local_rank", type=int, default=0)
+    parser.add_argument("--local_rank", "--local-rank", dest="local_rank", type=int, default=0)
     parser.add_argument(
         "opts",
         help="Modify config options using the command-line",
@@ -53,8 +49,12 @@ def main():
         synchronize()
 
     cfg.merge_from_file(args.config_file)
-    cfg.merge_from_list(args.opts)
+    cfg.merge_from_list(coerce_yacs_cli_opts(args.opts))
     cfg.freeze()
+
+    # get_dataset_statistics() writes under OUTPUT_DIR before inference mkdir runs
+    if cfg.OUTPUT_DIR:
+        mkdir(cfg.OUTPUT_DIR)
 
     save_dir = ""
     logger = setup_logger("maskrcnn_benchmark", save_dir, get_rank())
@@ -66,6 +66,7 @@ def main():
 
     model = build_detection_model(cfg)
     model.to(cfg.MODEL.DEVICE)
+    # CausalAnalysisPredictor: post-fusion mixer runs inside forward at eval (no extra TEST.* switch).
 
     # Initialize mixed-precision if necessary
     use_mixed_precision = cfg.DTYPE == 'float16'
@@ -117,6 +118,17 @@ def main():
             output_folder=output_folder,
         )
         synchronize()
+        if get_rank() == 0 and output_folder and getattr(cfg.TEST, "REPORT_STYLE_METRICS", False):
+            try:
+                _path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calculate_style_metrics.py")
+                _spec = importlib.util.spec_from_file_location("_style_metrics", _path)
+                _mod = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                _mod.run_style_metrics_from_eval_results(
+                    cfg, output_folder, data_loader_val.dataset, logger=logger
+                )
+            except Exception as ex:
+                logger.warning("Style metrics (TEST.REPORT_STYLE_METRICS): %s", ex)
 
 
 if __name__ == "__main__":

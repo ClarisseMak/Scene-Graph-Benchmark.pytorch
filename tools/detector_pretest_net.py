@@ -7,7 +7,7 @@ import argparse
 import os
 
 import torch
-from maskrcnn_benchmark.config import cfg
+from maskrcnn_benchmark.config import cfg, coerce_yacs_cli_opts
 from maskrcnn_benchmark.data import make_data_loader
 from maskrcnn_benchmark.engine.inference import inference
 from maskrcnn_benchmark.modeling.detector import build_detection_model
@@ -16,12 +16,7 @@ from maskrcnn_benchmark.utils.collect_env import collect_env_info
 from maskrcnn_benchmark.utils.comm import synchronize, get_rank
 from maskrcnn_benchmark.utils.logger import setup_logger
 from maskrcnn_benchmark.utils.miscellaneous import mkdir
-
-# Check if we can enable mixed-precision via apex.amp
-try:
-    from apex import amp
-except ImportError:
-    raise ImportError('Use APEX for mixed precision via apex.amp')
+from maskrcnn_benchmark.utils.amp_compat import amp
 
 
 def main():
@@ -32,7 +27,7 @@ def main():
         metavar="FILE",
         help="path to config file",
     )
-    parser.add_argument("--local_rank", type=int, default=0)
+    parser.add_argument("--local_rank", "--local-rank", dest="local_rank", type=int, default=0)
     parser.add_argument(
         "opts",
         help="Modify config options using the command-line",
@@ -53,7 +48,7 @@ def main():
         synchronize()
 
     cfg.merge_from_file(args.config_file)
-    cfg.merge_from_list(args.opts)
+    cfg.merge_from_list(coerce_yacs_cli_opts(args.opts))
     cfg.freeze()
 
     save_dir = ""

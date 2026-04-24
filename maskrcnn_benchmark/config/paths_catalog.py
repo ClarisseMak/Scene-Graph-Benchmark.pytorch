@@ -7,7 +7,7 @@ import copy
 
 class DatasetCatalog(object):
     #DATA_DIR = "/home/users/alatif/data/ImageCorpora/"
-    DATA_DIR = "/media/rafi/Samsung_T5/_DATASETS/"
+    DATA_DIR = "/mnt/f/projects/Scene-Graph-Benchmark.pytorch/datasets"
     DATASETS = {
         "coco_2017_train": {
             "img_dir": "coco/train2017",
@@ -162,6 +162,12 @@ class DatasetCatalog(object):
             args['flip_aug'] = cfg.MODEL.FLIP_AUG
             args['custom_eval'] = cfg.TEST.CUSTUM_EVAL
             args['custom_path'] = cfg.TEST.CUSTUM_PATH
+            args['predicate_set'] = cfg.DATASETS.PREDICATE_SET
+            args['style_annotation_file'] = getattr(cfg.DATASETS, "STYLE_ANNOTATION_FILE", "") or ""
+            args['style_stratified_split_file'] = getattr(cfg.DATASETS, "STYLE_STRATIFIED_SPLIT_FILE", "") or ""
+            args['style_stratified_split_strict'] = bool(
+                getattr(cfg.DATASETS, "STYLE_STRATIFIED_SPLIT_STRICT", True)
+            )
             return dict(
                 factory="VGDataset",
                 args=args,

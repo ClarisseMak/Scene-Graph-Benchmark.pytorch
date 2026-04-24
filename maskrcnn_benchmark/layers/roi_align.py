@@ -6,8 +6,7 @@ from torch.autograd.function import once_differentiable
 from torch.nn.modules.utils import _pair
 
 from maskrcnn_benchmark import _C
-
-from apex import amp
+from maskrcnn_benchmark.utils.amp_compat import amp
 
 class _ROIAlign(Function):
     @staticmethod

@@ -2,7 +2,7 @@
 import argparse
 import cv2
 
-from maskrcnn_benchmark.config import cfg
+from maskrcnn_benchmark.config import cfg, coerce_yacs_cli_opts
 from predictor import COCODemo
 
 import time
@@ -52,7 +52,7 @@ def main():
 
     # load config from file and command-line arguments
     cfg.merge_from_file(args.config_file)
-    cfg.merge_from_list(args.opts)
+    cfg.merge_from_list(coerce_yacs_cli_opts(args.opts or []))
     cfg.freeze()
 
     # prepare object that handles inference plus adds predictions on top of image

@@ -1,7 +1,15 @@
+# NumPy 1.20+ compatibility: restore deprecated float alias for pycocotools
+import numpy as np
+if not hasattr(np, 'float'):
+    np.float = np.float64
+if not hasattr(np, 'bool'):
+    np.bool = bool
+if not hasattr(np, 'int'):
+    np.int = int
+
 import logging
 import os
 import torch
-import numpy as np
 import json
 from tqdm import tqdm
 from functools import reduce
@@ -38,6 +46,14 @@ def do_vg_evaluation(
         mode = 'sgdet'
 
     num_rel_category = cfg.MODEL.ROI_RELATION_HEAD.NUM_CLASSES
+    if hasattr(dataset, "ind_to_predicates"):
+        if len(dataset.ind_to_predicates) != num_rel_category:
+            logger.warning(
+                "[FashionPredicateOntology] cfg.MODEL.ROI_RELATION_HEAD.NUM_CLASSES=%s "
+                "but len(dataset.ind_to_predicates)=%s. Please sync predicate ontology + NUM_CLASSES.",
+                str(num_rel_category),
+                str(len(dataset.ind_to_predicates)),
+            )
     multiple_preds = cfg.TEST.RELATION.MULTIPLE_PREDS
     iou_thres = cfg.TEST.RELATION.IOU_THRESHOLD
     assert mode in {'predcls', 'sgdet', 'sgcls', 'phrdet', 'preddet'}

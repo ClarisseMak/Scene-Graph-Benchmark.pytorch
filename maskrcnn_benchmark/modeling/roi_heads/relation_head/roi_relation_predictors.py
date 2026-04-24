@@ -18,6 +18,90 @@ from .utils_relation import layer_init, get_box_info, get_box_pair_info
 from maskrcnn_benchmark.data import get_dataset_statistics
 
 
+def _mean_pool_split(x: torch.Tensor, split_sizes):
+    # split_sizes: list[int], returns (len(split_sizes), x.size(1))
+    if x is None:
+        return None
+    if len(split_sizes) == 0:
+        return x.new_zeros((0, x.size(-1)))
+    chunks = x.split(split_sizes, dim=0)
+    pooled = []
+    for c in chunks:
+        if c.numel() == 0:
+            pooled.append(x.new_zeros((x.size(-1),)))
+        else:
+            pooled.append(c.mean(dim=0))
+    return torch.stack(pooled, dim=0)
+
+
+class StyleGCN(nn.Module):
+    """Lightweight GCN for image-level structural style context."""
+    def __init__(self, in_dim, hidden_dim, out_dim, num_rel_cls):
+        super(StyleGCN, self).__init__()
+        self.num_rel_cls = num_rel_cls
+        self.node_proj = nn.Linear(in_dim, hidden_dim)
+        self.gcn_fc1 = nn.Linear(hidden_dim, hidden_dim)
+        self.gcn_fc2 = nn.Linear(hidden_dim, out_dim)
+        layer_init(self.node_proj, xavier=True)
+        layer_init(self.gcn_fc1, xavier=True)
+        layer_init(self.gcn_fc2, xavier=True)
+
+    def _build_adj(self, num_nodes, rel_pair_idx, rel_logits):
+        device = rel_logits.device if rel_logits is not None else self.node_proj.weight.device
+        if num_nodes <= 0:
+            return torch.zeros((0, 0), device=device)
+        adj = torch.zeros((num_nodes, num_nodes), device=device)
+        if rel_pair_idx is not None and rel_logits is not None and rel_pair_idx.numel() > 0 and rel_logits.numel() > 0:
+            rel_prob = F.softmax(rel_logits, dim=-1)
+            if rel_prob.size(-1) > 1:
+                edge_w = rel_prob[:, 1:].sum(dim=-1)
+            else:
+                edge_w = rel_prob[:, 0]
+            subj = rel_pair_idx[:, 0].long()
+            obj = rel_pair_idx[:, 1].long()
+            adj.index_put_((subj, obj), edge_w, accumulate=True)
+            adj.index_put_((obj, subj), edge_w, accumulate=True)
+        adj = adj + torch.eye(num_nodes, device=device)
+        deg = adj.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        return adj / deg
+
+    def forward(self, node_feats, rel_pair_idx, rel_logits):
+        num_nodes = int(node_feats.size(0))
+        if num_nodes == 0:
+            out_dim = self.gcn_fc2.out_features
+            return node_feats.new_zeros((out_dim,))
+        x = self.node_proj(node_feats)
+        a = self._build_adj(num_nodes, rel_pair_idx, rel_logits)
+        x = torch.mm(a, x)
+        x = F.relu(self.gcn_fc1(x))
+        x = torch.mm(a, x)
+        x = self.gcn_fc2(x)
+        return x.mean(dim=0)
+
+
+class StylePostFusionMixer(nn.Module):
+    """
+    Diagram: h'_fusion = MixerBlock(LayerNorm(h_fusion)).
+    Implemented as residual MLP on LayerNorm(h): h' = h + MLP(LN(h)).
+    Last linear is zero-initialized so untrained mixer is an identity on h (same logits as no mixer).
+    """
+
+    def __init__(self, dim, hidden_dim):
+        super(StylePostFusionMixer, self).__init__()
+        self.ln = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim),
+        )
+        layer_init(self.mlp[0], xavier=True)
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, h_fusion):
+        return h_fusion + self.mlp(self.ln(h_fusion))
+
+
 @registry.ROI_RELATION_PREDICTOR.register("TransformerPredictor")
 class TransformerPredictor(nn.Module):
     def __init__(self, config, in_channels):
@@ -515,6 +599,32 @@ class CausalAnalysisPredictor(nn.Module):
         self.register_buffer("avg_post_ctx", torch.zeros(self.pooling_dim))
         self.register_buffer("untreated_feat", torch.zeros(self.pooling_dim))
 
+        # style classification head (image-level), 10 classes by default
+        self.style_num_classes = int(getattr(config.MODEL.ROI_RELATION_HEAD, "STYLE_NUM_CLASSES", 10))
+        self.style_ctx_dim = self.pooling_dim
+        self.style_ec_proj = nn.Linear(in_channels, self.style_ctx_dim)
+        self.style_gc_fc = nn.Linear(self.pooling_dim, self.style_ctx_dim)
+        self.style_gcn = StyleGCN(
+            in_dim=in_channels,
+            hidden_dim=self.style_ctx_dim,
+            out_dim=self.style_ctx_dim,
+            num_rel_cls=self.num_rel_cls,
+        )
+        layer_init(self.style_ec_proj, xavier=True)
+        layer_init(self.style_gc_fc, xavier=True)
+        fusion_dim = self.style_ctx_dim * 3
+        mixer_hidden = int(
+            getattr(
+                config.MODEL.ROI_RELATION_HEAD,
+                "STYLE_POST_FUSION_MIXER_HIDDEN_DIM",
+                2048,
+            )
+        )
+        mixer_hidden = max(mixer_hidden, fusion_dim // 8)
+        self.style_post_fusion_mixer = StylePostFusionMixer(fusion_dim, mixer_hidden)
+        self.style_classification_head = nn.Linear(fusion_dim, self.style_num_classes)
+        layer_init(self.style_classification_head, xavier=True)
+        
         
     def pair_feature_generate(self, roi_features, proposals, rel_pair_idxs, num_objs, obj_boxs, logger, ctx_average=False):
         # encode context infomation
@@ -585,7 +695,6 @@ class CausalAnalysisPredictor(nn.Module):
             post_ctx_rep = post_ctx_rep * self.spt_emb(pair_bbox)
 
         rel_dists = self.calculate_logits(union_features, post_ctx_rep, pair_pred, use_label_dist=False)
-        rel_dist_list = rel_dists.split(num_rels, dim=0)
 
         add_losses = {}
         # additional loss
@@ -636,9 +745,60 @@ class CausalAnalysisPredictor(nn.Module):
             else:
                 assert self.effect_type == 'none'
                 pass
-            rel_dist_list = rel_dists.split(num_rels, dim=0)
 
-        return obj_dist_list, rel_dist_list, add_losses
+        rel_dist_list = rel_dists.split(num_rels, dim=0)
+
+        # Style hierarchical fusion:
+        #   h_ec: all-entity visual context (all ROIs in image)
+        #   h_gc: global atmosphere from union visual features + FC projection
+        #   h_sc: structural scene context from GCN(obj nodes, TDE-refined rel logits)
+        obj_feature_list = roi_features.split(num_objs, dim=0)
+        pooled_union = _mean_pool_split(union_features, num_rels)
+        h_ec_list = []
+        h_sc_list = []
+        for obj_feat_img, pair_idx_img, rel_dist_img in zip(obj_feature_list, rel_pair_idxs, rel_dist_list):
+            if obj_feat_img.numel() == 0:
+                h_ec_list.append(roi_features.new_zeros((self.style_ctx_dim,)))
+                h_sc_list.append(roi_features.new_zeros((self.style_ctx_dim,)))
+                continue
+            h_ec_list.append(self.style_ec_proj(obj_feat_img).mean(dim=0))
+            h_sc_list.append(self.style_gcn(obj_feat_img, pair_idx_img, rel_dist_img))
+        h_ec = torch.stack(h_ec_list, dim=0) if len(h_ec_list) > 0 else roi_features.new_zeros((0, self.style_ctx_dim))
+        h_gc = self.style_gc_fc(pooled_union)
+        h_sc = torch.stack(h_sc_list, dim=0) if len(h_sc_list) > 0 else roi_features.new_zeros((0, self.style_ctx_dim))
+        ablation_mode = getattr(self.cfg.TEST, "ABLATION_MODE", "") or ""
+        if ablation_mode == "no_sc":
+            h_sc = torch.zeros_like(h_sc)
+        elif ablation_mode == "no_ec":
+            h_ec = torch.zeros_like(h_ec)
+        elif ablation_mode == "no_gc":
+            h_gc = torch.zeros_like(h_gc)
+        if getattr(self.cfg.TEST, "EXPORT_HIERARCHICAL_FEATURES", False):
+            self._hierarchical_export = {
+                "h_ec": h_ec.detach().cpu(),
+                "h_gc": h_gc.detach().cpu(),
+                "h_sc": h_sc.detach().cpu(),
+            }
+        else:
+            self._hierarchical_export = None
+        style_fused = torch.cat((h_ec, h_gc, h_sc), dim=-1)
+        # Eval: always apply post-fusion mixer (weights from ckpt; zero-init last layer → identity if untrained).
+        # Train: only when finetuning mixer (STYLE_POST_FUSION_MIXER_TRAIN).
+        apply_mixer = (not self.training) or (
+            self.training
+            and bool(
+                getattr(
+                    self.cfg.MODEL.ROI_RELATION_HEAD,
+                    "STYLE_POST_FUSION_MIXER_TRAIN",
+                    False,
+                )
+            )
+        )
+        if apply_mixer:
+            style_fused = self.style_post_fusion_mixer(style_fused)
+        style_logits = self.style_classification_head(style_fused)
+
+        return obj_dist_list, rel_dist_list, add_losses, style_logits
 
     def moving_average(self, holder, input):
         assert len(input.shape) == 2
@@ -657,6 +817,11 @@ class CausalAnalysisPredictor(nn.Module):
         vis_dists = self.vis_compress(vis_rep)
         ctx_dists = self.ctx_compress(ctx_rep)
 
+        # TODO(fashion-style KG / hierarchical contexts):
+        # If you have hierarchical contexts (h_ec, h_gc, h_sc) from a fashion KG,
+        # this is the key fusion point to inject a style-conditioned weight, e.g.
+        #   ctx_dists = ctx_dists * w(h_sc)   or   union_dists = fusion(vis, ctx(h_sc), frq)
+        # Keep it lightweight to avoid extra VRAM on RTX 3060 (12GB).
         if self.fusion_type == 'gate':
             ctx_gate_dists = self.ctx_gate_fc(ctx_rep)
             union_dists = ctx_dists * torch.sigmoid(vis_dists + frq_dists + ctx_gate_dists)

@@ -39,6 +39,8 @@ _C.MODEL.WEIGHT = ""
 
 # checkpoint of detector, for relation prediction
 _C.MODEL.PRETRAINED_DETECTOR_CKPT = ""
+# If True: ignore OUTPUT_DIR/last_checkpoint and load PRETRAINED_DETECTOR_CKPT (detector init, no optimizer resume).
+_C.MODEL.FORCE_PRETRAINED_DETECTOR_CKPT = False
 
 # -----------------------------------------------------------------------------
 # INPUT
@@ -289,6 +291,20 @@ _C.MODEL.ROI_RELATION_HEAD.PREDICTOR = "MotifPredictor"
 _C.MODEL.ROI_RELATION_HEAD.FEATURE_EXTRACTOR = "RelationFeatureExtractor"
 _C.MODEL.ROI_RELATION_HEAD.POOLING_ALL_LEVELS = True
 _C.MODEL.ROI_RELATION_HEAD.NUM_CLASSES = 51
+# Style head (CausalAnalysisPredictor): must match len(style_tags.QWEN_STYLE_TAGS_V1) (10 v2 tags)
+_C.MODEL.ROI_RELATION_HEAD.STYLE_NUM_CLASSES = 10
+# Inverse-frequency class weights for style CrossEntropy (see style_tags.STYLE_V2_EMPIRICAL_FREQ)
+_C.MODEL.ROI_RELATION_HEAD.STYLE_LOSS_USE_CLASS_WEIGHTS = True
+# STYLE_EC_FROM is retained for YAML compatibility; Style head now always uses all-entity ROIs.
+_C.MODEL.ROI_RELATION_HEAD.STYLE_EC_FROM = "all_objects"
+# If True, freeze relation box/union feature extractors; train predictor + style head only (smaller VRAM / stable FT)
+_C.MODEL.ROI_RELATION_HEAD.FREEZE_BOX_UNION_EXTRACTORS = False
+# Mixer-only finetune (CausalAnalysisPredictor): after relation_train_net fix_eval_modules, freeze all params except style_post_fusion_mixer
+_C.MODEL.ROI_RELATION_HEAD.FINETUNE_STYLE_MIXER_ONLY = False
+# If True, run style_post_fusion_mixer during training so gradients reach mixer (use with FINETUNE_STYLE_MIXER_ONLY)
+_C.MODEL.ROI_RELATION_HEAD.STYLE_POST_FUSION_MIXER_TRAIN = False
+# Hidden dim of LN+residual MLP mixer after Concat(h_ec,h_gc,h_sc)
+_C.MODEL.ROI_RELATION_HEAD.STYLE_POST_FUSION_MIXER_HIDDEN_DIM = 2048
 _C.MODEL.ROI_RELATION_HEAD.BATCH_SIZE_PER_IMAGE = 64
 _C.MODEL.ROI_RELATION_HEAD.POSITIVE_FRACTION = 0.25
 _C.MODEL.ROI_RELATION_HEAD.USE_GT_BOX = True
@@ -341,6 +357,22 @@ _C.MODEL.ROI_RELATION_HEAD.REL_PROP = [0.01858, 0.00057, 0.00051, 0.00109, 0.001
                                        0.02650, 0.06091, 0.00900, 0.00183, 0.00225, 0.00090, 0.00028, 0.00077, 0.04844, 0.08645,
                                        0.31621, 0.00088, 0.00301, 0.00042, 0.00186, 0.00100, 0.00027, 0.01012, 0.00010, 0.01286,
                                        0.00647, 0.00084, 0.01077, 0.00132, 0.00069, 0.00376, 0.00214, 0.11424, 0.01205, 0.02958]
+
+# ---------------------------------------------------------------------------- #
+# Dataset / ontology options
+# ---------------------------------------------------------------------------- #
+# Predicate ontology switch for VG-style datasets.
+# - "vg": use Visual Genome predicates from VG dict json (default behavior)
+# - "fashion_context": use Fashion-Context predicate ontology (see maskrcnn_benchmark/data/datasets/fashion_predicates.py)
+_C.DATASETS.PREDICATE_SET = "vg"
+# JSON from tools/fashion_style_adapter.py (full output or fashion_style_mapping.json) for image-level style_label
+_C.DATASETS.STYLE_ANNOTATION_FILE = ""
+# If mapping JSON contains train_sample_weight_by_image_id, use WeightedRandomSampler (train only; ignored if distributed)
+_C.DATASETS.STYLE_WEIGHTED_TRAIN_SAMPLER = True
+# If set, train/val/test image ids come from this JSON (see tools/stratified_style_split.py); bypasses H5 train/val carve for train&val
+_C.DATASETS.STYLE_STRATIFIED_SPLIT_FILE = ""
+# If True (default), split lists are applied on full H5 index order (ignore HDF5 train/test flags) so val/test JSON ids are kept even when H5 split differs
+_C.DATASETS.STYLE_STRATIFIED_SPLIT_STRICT = True
 
 _C.MODEL.VGG = CN()
 _C.MODEL.VGG.VGG16_OUT_CHANNELS= 512
@@ -576,6 +608,12 @@ _C.TEST.RELATION.SYNC_GATHER = False
 
 _C.TEST.ALLOW_LOAD_FROM_CACHE = True
 
+# Ablation (CausalAnalysisPredictor style fusion): "" full; "no_sc"|"no_ec"|"no_gc" zeros that branch before concat
+_C.TEST.ABLATION_MODE = ""
+# When True, CausalAnalysisPredictor stores last h_ec/h_gc/h_sc on CPU for tools/extract_hierarchical_features.py
+_C.TEST.EXPORT_HIERARCHICAL_FEATURES = False
+# After relation_test_net inference, write style classification summary to output_folder (main process only)
+_C.TEST.REPORT_STYLE_METRICS = False
 
 _C.TEST.CUSTUM_EVAL = False
 _C.TEST.CUSTUM_PATH = '.'

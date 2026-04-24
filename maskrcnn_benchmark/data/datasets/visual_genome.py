@@ -14,11 +14,102 @@ from maskrcnn_benchmark.structures.boxlist_ops import boxlist_iou
 
 BOX_SCALE = 1024  # Scale at which we have the boxes
 
+
+def _load_style_annotation_map(style_annotation_file):
+    """
+    Load mapping produced by tools/fashion_style_adapter.py (full or compact mapping file).
+
+    Returns:
+        dict[str, int] image_id -> style_label, or None if path is empty / missing.
+    """
+    if not style_annotation_file:
+        return None
+    path = os.path.expanduser(style_annotation_file)
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    out = {}
+    if isinstance(data, dict) and "by_image_id" in data:
+        for k, v in data["by_image_id"].items():
+            lab = v.get("style_label", -1) if isinstance(v, dict) else v
+            out[str(k)] = int(lab)
+        return out
+    if isinstance(data, dict) and "images" in data:
+        for _, v in data["images"].items():
+            if not isinstance(v, dict):
+                continue
+            iid = v.get("image_id")
+            if iid is None:
+                continue
+            st = v.get("style") or {}
+            lab = st.get("style_label", -1)
+            out[str(iid)] = int(lab)
+        return out
+    return None
+
+
+def _load_style_train_sample_weights(style_annotation_file):
+    """
+    Optional per-image sampling weights from fashion_style_adapter (balance-aware mapping).
+    Returns dict[str, float] image_id -> weight, or None.
+    """
+    if not style_annotation_file:
+        return None
+    path = os.path.expanduser(style_annotation_file)
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("train_sample_weight_by_image_id")
+    if not isinstance(raw, dict) or not raw:
+        return None
+    out = {}
+    for k, v in raw.items():
+        try:
+            out[str(k)] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out if out else None
+
+
+def _load_style_stratified_split_ids(split_file: str, split_name: str):
+    """
+    Load image_id set for train/val/test from tools/stratified_style_split.py output.
+    Returns set of str(image_id), or None if disabled / missing.
+    """
+    if not split_file or not split_name:
+        return None
+    path = os.path.expanduser(split_file)
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    ids = data.get(split_name)
+    if not isinstance(ids, list):
+        return None
+    out = set()
+    for x in ids:
+        if isinstance(x, int):
+            out.add(str(x))
+        else:
+            s = str(x).strip()
+            if s.isdigit():
+                out.add(s)
+            else:
+                out.add(s)
+    return out if out else None
+
+
 class VGDataset(torch.utils.data.Dataset):
 
     def __init__(self, split, img_dir, roidb_file, dict_file, image_file, transforms=None,
                 filter_empty_rels=True, num_im=-1, num_val_im=5000,
-                filter_duplicate_rels=True, filter_non_overlap=True, flip_aug=False, custom_eval=False, custom_path=''):
+                filter_duplicate_rels=True, filter_non_overlap=True, flip_aug=False, custom_eval=False, custom_path='',
+                predicate_set: str = "vg", style_annotation_file: str = "",
+                style_stratified_split_file: str = "", style_stratified_split_strict: bool = True):
         """
         Torch dataset for VisualGenome
         Parameters:
@@ -49,22 +140,61 @@ class VGDataset(torch.utils.data.Dataset):
         self.filter_duplicate_rels = filter_duplicate_rels and self.split == 'train'
         self.transforms = transforms
 
-        self.ind_to_classes, self.ind_to_predicates, self.ind_to_attributes = load_info(dict_file) # contiguous 151, 51 containing __background__
+        self.predicate_set = predicate_set
+        self.ind_to_classes, self.ind_to_predicates, self.ind_to_attributes = load_info(
+            dict_file,
+            predicate_set=self.predicate_set,
+        ) # contiguous 151, 51 containing __background__
         self.categories = {i : self.ind_to_classes[i] for i in range(len(self.ind_to_classes))}
+
+        # image_id (str) -> int label in [0, num_style_classes), or -1 if unknown / missing
+        self._style_by_image_id = _load_style_annotation_map(style_annotation_file)
+        self._style_train_sample_weight_by_image_id = _load_style_train_sample_weights(style_annotation_file)
+        self._style_stratified_ids = _load_style_stratified_split_ids(style_stratified_split_file, split)
+        self._style_stratified_split_strict = bool(style_stratified_split_strict)
 
         self.custom_eval = custom_eval
         if self.custom_eval:
             self.get_custom_imgs(custom_path)
         else:
-            self.split_mask, self.gt_boxes, self.gt_classes, self.gt_attributes, self.relationships = load_graphs(
-                self.roidb_file, self.split, num_im, num_val_im=num_val_im,
-                filter_empty_rels=filter_empty_rels,
-                filter_non_overlap=self.filter_non_overlap,
+            use_strict_json = (
+                self._style_stratified_ids is not None and self._style_stratified_split_strict
             )
+            if use_strict_json:
+                # image_file row order must match HDF5 row order (same as load_image_filenames).
+                self.filenames, self.img_info = load_image_filenames(img_dir, image_file)
+                id_per_h5_row = [str(x["image_id"]) for x in self.img_info]
+                self.split_mask, self.gt_boxes, self.gt_classes, self.gt_attributes, self.relationships = load_graphs(
+                    self.roidb_file,
+                    self.split,
+                    num_im,
+                    num_val_im=num_val_im,
+                    filter_empty_rels=filter_empty_rels,
+                    filter_non_overlap=self.filter_non_overlap,
+                    skip_h5_train_val_carve=False,
+                    strict_stratified_ids=self._style_stratified_ids,
+                    id_per_h5_row=id_per_h5_row,
+                )
+                self.filenames = [self.filenames[i] for i in np.where(self.split_mask)[0]]
+                self.img_info = [self.img_info[i] for i in np.where(self.split_mask)[0]]
+            else:
+                skip_h5_tv = self._style_stratified_ids is not None and self.split in {"train", "val"}
+                self.split_mask, self.gt_boxes, self.gt_classes, self.gt_attributes, self.relationships = load_graphs(
+                    self.roidb_file,
+                    self.split,
+                    num_im,
+                    num_val_im=num_val_im,
+                    filter_empty_rels=filter_empty_rels,
+                    filter_non_overlap=self.filter_non_overlap,
+                    skip_h5_train_val_carve=skip_h5_tv,
+                )
 
-            self.filenames, self.img_info = load_image_filenames(img_dir, image_file) # length equals to split_mask
-            self.filenames = [self.filenames[i] for i in np.where(self.split_mask)[0]]
-            self.img_info = [self.img_info[i] for i in np.where(self.split_mask)[0]]
+                self.filenames, self.img_info = load_image_filenames(img_dir, image_file)
+                self.filenames = [self.filenames[i] for i in np.where(self.split_mask)[0]]
+                self.img_info = [self.img_info[i] for i in np.where(self.split_mask)[0]]
+
+                if self._style_stratified_ids is not None:
+                    self._apply_style_stratified_split_filter()
 
 
     def __getitem__(self, index):
@@ -96,8 +226,14 @@ class VGDataset(torch.utils.data.Dataset):
 
 
     def get_statistics(self):
-        fg_matrix, bg_matrix = get_VG_statistics(img_dir=self.img_dir, roidb_file=self.roidb_file, dict_file=self.dict_file,
-                                                image_file=self.image_file, must_overlap=True)
+        fg_matrix, bg_matrix = get_VG_statistics(
+            img_dir=self.img_dir,
+            roidb_file=self.roidb_file,
+            dict_file=self.dict_file,
+            image_file=self.image_file,
+            must_overlap=True,
+            predicate_set=self.predicate_set,
+        )
         eps = 1e-3
         bg_matrix += 1
         fg_matrix[:, :, 0] = bg_matrix
@@ -136,6 +272,47 @@ class VGDataset(torch.utils.data.Dataset):
         # correct_img_info(self.img_dir, self.image_file)
         return self.img_info[index]
 
+    def get_style_train_sample_weight(self, index):
+        """For WeightedRandomSampler: >1 oversamples rare style classes (train split only)."""
+        if self.split != "train" or not self._style_train_sample_weight_by_image_id:
+            return 1.0
+        if self.custom_eval or index >= len(self.img_info):
+            return 1.0
+        img_id = self.img_info[index].get("image_id", None)
+        if img_id is None:
+            try:
+                base = os.path.basename(self.filenames[index])
+                img_id = int(os.path.splitext(base)[0])
+            except Exception:
+                return 1.0
+        w = self._style_train_sample_weight_by_image_id.get(str(img_id), 1.0)
+        return float(w) if w > 0 else 1.0
+
+    def _apply_style_stratified_split_filter(self):
+        """Keep only images whose image_id is listed in fashion_style_splits.json for this split."""
+        allowed = self._style_stratified_ids
+        keep = []
+        for j in range(len(self.filenames)):
+            iid = self.img_info[j].get("image_id", None)
+            if iid is None:
+                try:
+                    base = os.path.basename(self.filenames[j])
+                    iid = int(os.path.splitext(base)[0])
+                except Exception:
+                    continue
+            if str(iid) in allowed:
+                keep.append(j)
+        if not keep:
+            raise RuntimeError(
+                "STYLE_STRATIFIED_SPLIT_FILE: no images left after filtering for split=%r (check id format vs JSON)." % self.split
+            )
+        self.gt_boxes = [self.gt_boxes[j] for j in keep]
+        self.gt_classes = [self.gt_classes[j] for j in keep]
+        self.gt_attributes = [self.gt_attributes[j] for j in keep]
+        self.relationships = [self.relationships[j] for j in keep]
+        self.filenames = [self.filenames[j] for j in keep]
+        self.img_info = [self.img_info[j] for j in keep]
+
     def get_groundtruth(self, index, evaluation=False, flip_img=False):
         img_info = self.get_img_info(index)
         w, h = img_info['width'], img_info['height']
@@ -162,6 +339,14 @@ class VGDataset(torch.utils.data.Dataset):
                 all_rel_sets[(o0, o1)].append(r)
             relation = [(k[0], k[1], np.random.choice(v)) for k,v in all_rel_sets.items()]
             relation = np.array(relation, dtype=np.int32)
+        # HDF5 stores Visual Genome predicate ids; map to fashion (or other) ontology so
+        # relation_map / relation_tuple match NUM_CLASSES and SGG eval (same as get_VG_statistics).
+        ps = (self.predicate_set or "").strip().lower()
+        if ps not in {"vg", "visual_genome", "visual-genome"}:
+            for i in range(relation.shape[0]):
+                relation[i, 2] = _map_vg_rel_index_to_fashion(
+                    int(relation[i, 2]), self.dict_file, self.predicate_set
+                )
         
         # add relation to target
         num_box = len(target)
@@ -174,13 +359,33 @@ class VGDataset(torch.utils.data.Dataset):
                 relation_map[int(relation[i,0]), int(relation[i,1])] = int(relation[i,2])
         target.add_field("relation", relation_map, is_triplet=True)
 
+        # Image-level fashion style (for style head); -1 = ignore in style_loss (CrossEntropy ignore_index)
+        style_label = -1
+        if self._style_by_image_id is not None and len(self.filenames) > index:
+            img_id = None
+            if index < len(self.img_info):
+                img_id = self.img_info[index].get("image_id", None)
+            if img_id is None:
+                try:
+                    base = os.path.basename(self.filenames[index])
+                    img_id = int(os.path.splitext(base)[0])
+                except Exception:
+                    img_id = None
+            if img_id is not None:
+                style_label = int(self._style_by_image_id.get(str(img_id), -1))
+        # Image-level field: must use is_image_level=True so BoxList.clip_to_image / __getitem__ do not index it per-box
+        target.add_field(
+            "style_label",
+            torch.tensor(style_label, dtype=torch.long),
+            is_image_level=True,
+        )
+
         if evaluation:
             target = target.clip_to_image(remove_empty=False)
             target.add_field("relation_tuple", torch.LongTensor(relation)) # for evaluation
             return target
-        else:
-            target = target.clip_to_image(remove_empty=True)
-            return target
+        target = target.clip_to_image(remove_empty=True)
+        return target
 
     def __len__(self):
         if self.custom_eval:
@@ -188,14 +393,46 @@ class VGDataset(torch.utils.data.Dataset):
         return len(self.filenames)
 
 
-def get_VG_statistics(img_dir, roidb_file, dict_file, image_file, must_overlap=True):
-    train_data = VGDataset(split='train', img_dir=img_dir, roidb_file=roidb_file, 
-                        dict_file=dict_file, image_file=image_file, num_val_im=5000, 
-                        filter_duplicate_rels=False)
+def _map_vg_rel_index_to_fashion(gtr: int, dict_file: str, fashion_predicate_set: str) -> int:
+    """H5 stores Visual Genome predicate indices; map by name into fashion_context (or other) ontology."""
+    _, vg_predicates, _ = load_info(dict_file, predicate_set="vg")
+    from maskrcnn_benchmark.data.datasets.fashion_predicates import get_predicate_set
+    fashion_predicates = get_predicate_set(fashion_predicate_set)
+    ft = {p: i for i, p in enumerate(fashion_predicates)}
+    gtr = int(gtr)
+    if gtr < 0 or gtr >= len(vg_predicates):
+        return 0
+    name = vg_predicates[gtr]
+    return int(ft.get(name, 0))
+
+
+def get_VG_statistics(
+    img_dir,
+    roidb_file,
+    dict_file,
+    image_file,
+    must_overlap=True,
+    predicate_set: str = "vg",
+):
+    # Statistics pass: no style JSON needed (faster); predicate_set must match training ontology size.
+    train_data = VGDataset(
+        split="train",
+        img_dir=img_dir,
+        roidb_file=roidb_file,
+        dict_file=dict_file,
+        image_file=image_file,
+        num_val_im=5000,
+        filter_duplicate_rels=False,
+        predicate_set=predicate_set,
+        style_annotation_file="",
+    )
     num_obj_classes = len(train_data.ind_to_classes)
     num_rel_classes = len(train_data.ind_to_predicates)
     fg_matrix = np.zeros((num_obj_classes, num_obj_classes, num_rel_classes), dtype=np.int64)
     bg_matrix = np.zeros((num_obj_classes, num_obj_classes), dtype=np.int64)
+
+    ps = (predicate_set or "vg").strip().lower()
+    use_fashion_map = ps not in {"vg", "visual_genome", "visual-genome"}
 
     for ex_ind in tqdm(range(len(train_data))):
         gt_classes = train_data.gt_classes[ex_ind].copy()
@@ -204,8 +441,13 @@ def get_VG_statistics(img_dir, roidb_file, dict_file, image_file, must_overlap=T
 
         # For the foreground, we'll just look at everything
         o1o2 = gt_classes[gt_relations[:, :2]]
-        for (o1, o2), gtr in zip(o1o2, gt_relations[:,2]):
-            fg_matrix[o1, o2, gtr] += 1
+        for (o1, o2), gtr in zip(o1o2, gt_relations[:, 2]):
+            if use_fashion_map:
+                gti = _map_vg_rel_index_to_fashion(int(gtr), dict_file, predicate_set)
+            else:
+                gti = int(gtr)
+            if 0 <= gti < num_rel_classes:
+                fg_matrix[o1, o2, gti] += 1
         # For the background, get all of the things that overlap.
         o1o2_total = gt_classes[np.array(
             box_filter(gt_boxes, must_overlap=must_overlap), dtype=int)]
@@ -220,10 +462,10 @@ def box_filter(boxes, must_overlap=False):
     If no overlapping boxes, use all of them."""
     n_cands = boxes.shape[0]
 
-    overlaps = bbox_overlaps(boxes.astype(np.float), boxes.astype(np.float), to_move=0) > 0
+    overlaps = bbox_overlaps(boxes.astype(np.float32), boxes.astype(np.float32), to_move=0) > 0
     np.fill_diagonal(overlaps, 0)
 
-    all_possib = np.ones_like(overlaps, dtype=np.bool)
+    all_possib = np.ones_like(overlaps, dtype=bool)
     np.fill_diagonal(all_possib, 0)
 
     if must_overlap:
@@ -269,7 +511,7 @@ def correct_img_info(img_dir, image_file):
     with open(image_file, 'w') as outfile:  
         json.dump(data, outfile)
 
-def load_info(dict_file, add_bg=True):
+def load_info(dict_file, add_bg=True, predicate_set: str = "vg"):
     """
     Loads the file containing the visual genome label meanings
     """
@@ -280,7 +522,14 @@ def load_info(dict_file, add_bg=True):
         info['attribute_to_idx']['__background__'] = 0
 
     class_to_ind = info['label_to_idx']
-    predicate_to_ind = info['predicate_to_idx']
+    if (predicate_set or "").strip().lower() in {"vg", "visual_genome", "visual-genome"}:
+        predicate_to_ind = info['predicate_to_idx']
+    else:
+        # Fashion-context predicate ontology for fashion scene style analysis.
+        # NOTE: when training, your roidb_file H5 must be encoded with the same predicate indices.
+        from maskrcnn_benchmark.data.datasets.fashion_predicates import get_predicate_set
+        ind_to_predicates_override = get_predicate_set(predicate_set)
+        predicate_to_ind = {p: i for i, p in enumerate(ind_to_predicates_override)}
     attribute_to_ind = info['attribute_to_idx']
     ind_to_classes = sorted(class_to_ind, key=lambda k: class_to_ind[k])
     ind_to_predicates = sorted(predicate_to_ind, key=lambda k: predicate_to_ind[k])
@@ -319,7 +568,17 @@ def load_image_filenames(img_dir, image_file):
     return fns, img_info
 
 
-def load_graphs(roidb_file, split, num_im, num_val_im, filter_empty_rels, filter_non_overlap):
+def load_graphs(
+    roidb_file,
+    split,
+    num_im,
+    num_val_im,
+    filter_empty_rels,
+    filter_non_overlap,
+    skip_h5_train_val_carve=False,
+    strict_stratified_ids=None,
+    id_per_h5_row=None,
+):
     """
     Load the file containing the GT boxes and relations, as well as the dataset split
     Parameters:
@@ -329,6 +588,8 @@ def load_graphs(roidb_file, split, num_im, num_val_im, filter_empty_rels, filter
         num_val_im: Number of validation images
         filter_empty_rels: (will be filtered otherwise.)
         filter_non_overlap: If training, filter images that dont overlap.
+        strict_stratified_ids: If set, select rows only by these image_id strings (ignore HDF5 split flags).
+        id_per_h5_row: image_id per HDF5 row (same length as split), from image_data.json order used in load_image_filenames.
     Return: 
         image_index: numpy array corresponding to the index of images we're using
         boxes: List where each element is a [num_gt, 4] array of ground 
@@ -339,26 +600,53 @@ def load_graphs(roidb_file, split, num_im, num_val_im, filter_empty_rels, filter
     """
     roi_h5 = h5py.File(roidb_file, 'r')
     data_split = roi_h5['split'][:]
-    split_flag = 2 if split == 'test' else 0
-    split_mask = data_split == split_flag
+    if strict_stratified_ids is not None:
+        if id_per_h5_row is None:
+            raise ValueError("load_graphs: id_per_h5_row is required when strict_stratified_ids is set")
+        n = int(data_split.shape[0])
+        if len(id_per_h5_row) != n:
+            raise RuntimeError(
+                "STYLE strict split: len(image ids from image_file)=%s != len(h5 split)=%s. "
+                "image_data.json / roidb alignment is broken for this dataset."
+                % (len(id_per_h5_row), n)
+            )
+        allowed = strict_stratified_ids
+        split_mask = np.zeros(n, dtype=bool)
+        img_first_box = roi_h5['img_to_first_box'][:]
+        img_first_rel = roi_h5['img_to_first_rel'][:]
+        for i in range(n):
+            if id_per_h5_row[i] not in allowed:
+                continue
+            if img_first_box[i] < 0:
+                continue
+            if filter_empty_rels and img_first_rel[i] < 0:
+                continue
+            split_mask[i] = True
+        image_index = np.where(split_mask)[0]
+        if num_im > -1:
+            image_index = image_index[:num_im]
+        split_mask = np.zeros_like(data_split).astype(bool)
+        split_mask[image_index] = True
+    else:
+        split_flag = 2 if split == 'test' else 0
+        split_mask = data_split == split_flag
 
-    # Filter out images without bounding boxes
-    split_mask &= roi_h5['img_to_first_box'][:] >= 0
-    if filter_empty_rels:
-        split_mask &= roi_h5['img_to_first_rel'][:] >= 0
+        # Filter out images without bounding boxes
+        split_mask &= roi_h5['img_to_first_box'][:] >= 0
+        if filter_empty_rels:
+            split_mask &= roi_h5['img_to_first_rel'][:] >= 0
 
-    image_index = np.where(split_mask)[0]
-    if num_im > -1:
-        image_index = image_index[:num_im]
-    if num_val_im > 0:
-        if split == 'val':
-            image_index = image_index[:num_val_im]
-        elif split == 'train':
-            image_index = image_index[num_val_im:]
+        image_index = np.where(split_mask)[0]
+        if num_im > -1:
+            image_index = image_index[:num_im]
+        if num_val_im > 0 and not skip_h5_train_val_carve:
+            if split == 'val':
+                image_index = image_index[:num_val_im]
+            elif split == 'train':
+                image_index = image_index[num_val_im:]
 
-
-    split_mask = np.zeros_like(data_split).astype(bool)
-    split_mask[image_index] = True
+        split_mask = np.zeros_like(data_split).astype(bool)
+        split_mask[image_index] = True
 
     # Get box information
     all_labels = roi_h5['labels'][:, 0]

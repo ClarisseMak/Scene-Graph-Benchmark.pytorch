@@ -93,7 +93,16 @@ def inference(
         output_folder=None,
         logger=None,
 ):
-    load_prediction_from_cache = cfg.TEST.ALLOW_LOAD_FROM_CACHE and output_folder is not None and os.path.exists(os.path.join(output_folder, "eval_results.pytorch"))
+    cache_path = (
+        os.path.join(output_folder, "eval_results.pytorch")
+        if output_folder is not None
+        else None
+    )
+    load_prediction_from_cache = (
+        cfg.TEST.ALLOW_LOAD_FROM_CACHE
+        and cache_path is not None
+        and os.path.isfile(cache_path)
+    )
     # convert to a torch.device for efficiency
     device = torch.device(device)
     num_devices = get_world_size()
@@ -104,10 +113,28 @@ def inference(
     total_timer = Timer()
     inference_timer = Timer()
     total_timer.tic()
+    predictions = None
     if load_prediction_from_cache:
-        predictions = torch.load(os.path.join(output_folder, "eval_results.pytorch"), map_location=torch.device("cpu"))['predictions']
-    else:
-        predictions = compute_on_dataset(model, data_loader, device, synchronize_gather=cfg.TEST.RELATION.SYNC_GATHER, timer=inference_timer)
+        cached = torch.load(cache_path, map_location=torch.device("cpu"))
+        predictions = cached.get("predictions")
+        n_cached = len(predictions) if predictions is not None else -1
+        if predictions is None or n_cached != len(dataset):
+            logger.warning(
+                "Ignoring stale eval_results cache at %s: len(predictions)=%s != len(dataset)=%s; re-running inference.",
+                cache_path,
+                n_cached,
+                len(dataset),
+            )
+            load_prediction_from_cache = False
+            predictions = None
+    if not load_prediction_from_cache:
+        predictions = compute_on_dataset(
+            model,
+            data_loader,
+            device,
+            synchronize_gather=cfg.TEST.RELATION.SYNC_GATHER,
+            timer=inference_timer,
+        )
     # wait for all processes to complete before measuring the time
     synchronize()
     total_time = total_timer.toc()

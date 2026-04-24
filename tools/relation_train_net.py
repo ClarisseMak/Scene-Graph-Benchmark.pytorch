@@ -8,14 +8,16 @@ Basic training script for PyTorch
 from maskrcnn_benchmark.utils.env import setup_environment  # noqa F401 isort:skip
 
 import argparse
+import json
 import os
 import time
 import datetime
+import traceback
 
 import torch
 from torch.nn.utils import clip_grad_norm_
 
-from maskrcnn_benchmark.config import cfg
+from maskrcnn_benchmark.config import cfg, coerce_yacs_cli_opts
 from maskrcnn_benchmark.data import make_data_loader
 from maskrcnn_benchmark.solver import make_lr_scheduler
 from maskrcnn_benchmark.solver import make_optimizer
@@ -30,14 +32,29 @@ from maskrcnn_benchmark.utils.imports import import_file
 from maskrcnn_benchmark.utils.logger import setup_logger, debug_print
 from maskrcnn_benchmark.utils.miscellaneous import mkdir, save_config
 from maskrcnn_benchmark.utils.metric_logger import MetricLogger
+from maskrcnn_benchmark.utils.amp_compat import amp
+
+# region agent log
+_AGENT_DEBUG_LOG = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "debug-3bb549.log"))
 
 
-# See if we can use apex.DistributedDataParallel instead of the torch default,
-# and enable mixed-precision via apex.amp
-try:
-    from apex import amp
-except ImportError:
-    raise ImportError('Use APEX for multi-precision via apex.amp')
+def _agent_debug_log(message, data=None, hypothesis_id="H0"):
+    payload = {
+        "sessionId": "3bb549",
+        "timestamp": int(time.time() * 1000),
+        "message": message,
+        "data": data or {},
+        "hypothesisId": hypothesis_id,
+        "runId": "repro1",
+    }
+    try:
+        with open(_AGENT_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# endregion
 
 
 def train(cfg, local_rank, distributed, logger):
@@ -47,9 +64,28 @@ def train(cfg, local_rank, distributed, logger):
 
     # modules that should be always set in eval mode
     # their eval() method should be called after model.train() is called
-    eval_modules = (model.rpn, model.backbone, model.roi_heads.box,)
- 
+    eval_modules = [model.rpn, model.backbone, model.roi_heads.box]
+    if getattr(cfg.MODEL.ROI_RELATION_HEAD, "FREEZE_BOX_UNION_EXTRACTORS", False):
+        eval_modules.extend(
+            [
+                model.roi_heads.relation.box_feature_extractor,
+                model.roi_heads.relation.union_feature_extractor,
+            ]
+        )
+    eval_modules = tuple(eval_modules)
+
     fix_eval_modules(eval_modules)
+
+    if getattr(cfg.MODEL.ROI_RELATION_HEAD, "FINETUNE_STYLE_MIXER_ONLY", False):
+        n_train = 0
+        for name, p in model.named_parameters():
+            p.requires_grad = "style_post_fusion_mixer" in name
+            if p.requires_grad:
+                n_train += 1
+        logger.info(
+            "FINETUNE_STYLE_MIXER_ONLY: %d parameter tensors trainable (style_post_fusion_mixer only)",
+            n_train,
+        )
 
     # NOTE, we slow down the LR of the layers start with the names in slow_heads
     if cfg.MODEL.ROI_RELATION_HEAD.PREDICTOR == "IMPPredictor":
@@ -96,26 +132,90 @@ def train(cfg, local_rank, distributed, logger):
     checkpointer = DetectronCheckpointer(
         cfg, model, optimizer, scheduler, output_dir, save_to_disk, custom_scheduler=True
     )
-    # if there is certain checkpoint in output_dir, load it, else load pretrained detector
-    if checkpointer.has_checkpoint():
-        extra_checkpoint_data = checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, 
-                                       update_schedule=cfg.SOLVER.UPDATE_SCHEDULE_DURING_LOAD)
-        arguments.update(extra_checkpoint_data)
+    force_pretrained = getattr(cfg.MODEL, "FORCE_PRETRAINED_DETECTOR_CKPT", False)
+    # Resume only when OUTPUT_DIR has last_checkpoint and user did not request a forced detector init.
+    if checkpointer.has_checkpoint() and not force_pretrained:
+        # region agent log
+        _agent_debug_log(
+            "branch_resume_from_output_dir",
+            {
+                "output_dir": output_dir,
+                "pretrained_arg": cfg.MODEL.PRETRAINED_DETECTOR_CKPT,
+                "force_pretrained": force_pretrained,
+            },
+            "H3",
+        )
+        # endregion
+        try:
+            extra_checkpoint_data = checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, 
+                                           update_schedule=cfg.SOLVER.UPDATE_SCHEDULE_DURING_LOAD)
+            arguments.update(extra_checkpoint_data)
+        except Exception as e:
+            _agent_debug_log(
+                "resume_checkpoint_load_failed",
+                {"error": str(e), "traceback": traceback.format_exc()},
+                "H3",
+            )
+            raise
     else:
         # load_mapping is only used when we init current model from detection model.
-        checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, with_optim=False, load_mapping=load_mapping)
+        # region agent log
+        _agent_debug_log(
+            "before_checkpointer_load",
+            {
+                "ckpt": cfg.MODEL.PRETRAINED_DETECTOR_CKPT,
+                "exists": os.path.isfile(cfg.MODEL.PRETRAINED_DETECTOR_CKPT)
+                if cfg.MODEL.PRETRAINED_DETECTOR_CKPT
+                else False,
+                "has_checkpoint_in_output": checkpointer.has_checkpoint(),
+                "force_pretrained": force_pretrained,
+            },
+            "H2",
+        )
+        # endregion
+        try:
+            checkpointer.load(
+                cfg.MODEL.PRETRAINED_DETECTOR_CKPT,
+                with_optim=False,
+                load_mapping=load_mapping,
+                force_f=force_pretrained,
+            )
+        except Exception as e:
+            _agent_debug_log(
+                "checkpointer_load_failed",
+                {"error": str(e), "traceback": traceback.format_exc()},
+                "H4",
+            )
+            raise
+    # region agent log
+    _agent_debug_log(
+        "after_checkpointer_ok",
+        {"force_pretrained": force_pretrained, "has_checkpoint_file": checkpointer.has_checkpoint()},
+        "H4",
+    )
+    # endregion
     debug_print(logger, 'end load checkpointer')
-    train_data_loader = make_data_loader(
-        cfg,
-        mode='train',
-        is_distributed=distributed,
-        start_iter=arguments["iteration"],
-    )
-    val_data_loaders = make_data_loader(
-        cfg,
-        mode='val',
-        is_distributed=distributed,
-    )
+    try:
+        train_data_loader = make_data_loader(
+            cfg,
+            mode='train',
+            is_distributed=distributed,
+            start_iter=arguments["iteration"],
+        )
+        val_data_loaders = make_data_loader(
+            cfg,
+            mode='val',
+            is_distributed=distributed,
+        )
+    except Exception as e:
+        # region agent log
+        _agent_debug_log(
+            "make_data_loader_failed",
+            {"error": str(e), "traceback": traceback.format_exc()},
+            "H4",
+        )
+        # endregion
+        raise
     debug_print(logger, 'end dataloader')
     checkpoint_period = cfg.SOLVER.CHECKPOINT_PERIOD
 
@@ -317,7 +417,7 @@ def main():
         help="path to config file",
         type=str,
     )
-    parser.add_argument("--local_rank", type=int, default=0)
+    parser.add_argument("--local_rank", "--local-rank", dest="local_rank", type=int, default=0)
     parser.add_argument(
         "--skip-test",
         dest="skip_test",
@@ -344,8 +444,24 @@ def main():
         synchronize()
 
     cfg.merge_from_file(args.config_file)
-    cfg.merge_from_list(args.opts)
+    cfg.merge_from_list(coerce_yacs_cli_opts(args.opts))
     cfg.freeze()
+
+    # region agent log
+    _cf = args.config_file or ""
+    _ck = getattr(cfg.MODEL, "PRETRAINED_DETECTOR_CKPT", "") or ""
+    _agent_debug_log(
+        "main_after_cfg_freeze",
+        {
+            "config_file": _cf,
+            "config_exists": os.path.isfile(_cf) if _cf else False,
+            "pretrained_ckpt": _ck,
+            "pretrained_exists": os.path.isfile(_ck) if _ck else False,
+            "cwd": os.getcwd(),
+        },
+        "H1",
+    )
+    # endregion
 
     output_dir = cfg.OUTPUT_DIR
     if output_dir:
@@ -369,7 +485,17 @@ def main():
     # save overloaded model config in the output directory
     save_config(cfg, output_config_path)
 
-    model = train(cfg, args.local_rank, args.distributed, logger)
+    try:
+        model = train(cfg, args.local_rank, args.distributed, logger)
+    except Exception as e:
+        # region agent log
+        _agent_debug_log(
+            "train_main_exception",
+            {"error": str(e), "traceback": traceback.format_exc()},
+            "H5",
+        )
+        # endregion
+        raise
 
     if not args.skip_test:
         run_test(cfg, model, args.distributed, logger)

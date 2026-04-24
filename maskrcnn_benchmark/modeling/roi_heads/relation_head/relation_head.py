@@ -1,5 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from maskrcnn_benchmark.structures.boxlist_ops import boxlist_iou
@@ -77,19 +78,52 @@ class ROIRelationHead(torch.nn.Module):
         
         # final classifier that converts the features into predictions
         # should corresponding to all the functions and layers after the self.context class
-        refine_logits, relation_logits, add_losses = self.predictor(proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger)
+        pred_out = self.predictor(proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger)
+        if isinstance(pred_out, (list, tuple)) and len(pred_out) == 4:
+            refine_logits, relation_logits, add_losses, style_logits = pred_out
+        else:
+            refine_logits, relation_logits, add_losses = pred_out
+            style_logits = None
 
         # for test
         if not self.training:
+            # Relation logits use the same forward pass as the style head (30-predicate / causal unbiased path when EFFECT_ANALYSIS is on).
             result = self.post_processor((relation_logits, refine_logits), rel_pair_idxs, proposals)
+            if style_logits is not None:
+                for i, bl in enumerate(result):
+                    sl = style_logits[i].detach().cpu()
+                    bl.add_field("style_logits", sl, is_image_level=True)
+                    bl.add_field("pred_style", sl.argmax(dim=-1), is_image_level=True)
+                    bl.add_field("pred_style_probs", F.softmax(sl, dim=-1), is_image_level=True)
             return roi_features, result, {}
 
-        loss_relation, loss_refine = self.loss_evaluator(proposals, rel_labels, relation_logits, refine_logits)
+        style_labels = None
+        if style_logits is not None and targets is not None:
+            # image-level style labels, expected as an int field on targets[i]
+            try:
+                style_labels = torch.as_tensor(
+                    [int(t.get_field("style_label")) for t in targets],
+                    device=style_logits.device,
+                )
+            except Exception:
+                style_labels = None
+
+        loss_relation, loss_refine, loss_style = self.loss_evaluator(
+            proposals,
+            rel_labels,
+            relation_logits,
+            refine_logits,
+            style_logits=style_logits,
+            style_labels=style_labels,
+        )
 
         if self.cfg.MODEL.ATTRIBUTE_ON and isinstance(loss_refine, (list, tuple)):
             output_losses = dict(loss_rel=loss_relation, loss_refine_obj=loss_refine[0], loss_refine_att=loss_refine[1])
         else:
             output_losses = dict(loss_rel=loss_relation, loss_refine_obj=loss_refine)
+
+        if loss_style is not None:
+            output_losses["style_loss"] = loss_style
 
         output_losses.update(add_losses)
 

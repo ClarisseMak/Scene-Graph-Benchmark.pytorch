@@ -203,7 +203,16 @@ def load_word_vectors(root, wv_type, dim):
         print('downloading word vectors from {}'.format(url))
         filename = os.path.basename(fname)
         if not os.path.exists(root):
-            os.makedirs(root)
+            try:
+                os.makedirs(root)
+            except OSError as e:
+                raise RuntimeError(
+                    "Cannot create or use GLOVE_DIR %r (%s). "
+                    "Set cfg GLOVE_DIR to the folder that already contains glove.6B.200d.pt "
+                    "(e.g. ./glove from repo root). "
+                    "If you passed GLOVE_DIR \"$PROJ/glove\" in bash, an empty PROJ becomes path /glove."
+                    % (root, e)
+                ) from e
         with tqdm(unit='B', unit_scale=True, miniters=1, desc=filename) as t:
             fname, _ = urlretrieve(url, fname, reporthook=reporthook(t))
             with zipfile.ZipFile(fname, "r") as zf:

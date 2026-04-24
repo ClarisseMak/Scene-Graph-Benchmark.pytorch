@@ -1,6 +1,8 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+import json
 import logging
 import os
+import time
 
 import torch
 
@@ -52,10 +54,48 @@ class Checkpointer(object):
         torch.save(data, save_file)
         self.tag_last_checkpoint(save_file)
 
-    def load(self, f=None, with_optim=True, update_schedule=False, load_mapping={}):
-        if self.has_checkpoint():
-            # override argument with existing checkpoint
-            f = self.get_checkpoint_file()
+    def load(self, f=None, with_optim=True, update_schedule=False, load_mapping={}, force_f=False):
+        # When save_dir has last_checkpoint, default is to resume from that path (ignores f).
+        # Set force_f=True to always use the provided f (e.g. load detector weights only).
+        f_arg = f
+        had_last = self.has_checkpoint()
+        if self.has_checkpoint() and not force_f:
+            resume_path = self.get_checkpoint_file()
+            if f and resume_path != f:
+                self.logger.warning(
+                    "OUTPUT_DIR has last_checkpoint; resuming from %s (ignoring provided checkpoint path %s). "
+                    "Set MODEL.FORCE_PRETRAINED_DETECTOR_CKPT True to load from PRETRAINED_DETECTOR_CKPT instead.",
+                    resume_path,
+                    f,
+                )
+            f = resume_path
+        # region agent log
+        try:
+            root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            logp = os.path.join(root, "debug-3bb549.log")
+            with open(logp, "a", encoding="utf-8") as _df:
+                _df.write(
+                    json.dumps(
+                        {
+                            "sessionId": "3bb549",
+                            "timestamp": int(time.time() * 1000),
+                            "message": "checkpoint_load_resolved",
+                            "hypothesisId": "H_ckpt",
+                            "data": {
+                                "f_arg": f_arg,
+                                "f_resolved": f,
+                                "force_f": force_f,
+                                "had_last_checkpoint": had_last,
+                                "save_dir": self.save_dir,
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # endregion
         if not f:
             # no checkpoint could be found
             self.logger.info("No checkpoint found. Initializing model from scratch")

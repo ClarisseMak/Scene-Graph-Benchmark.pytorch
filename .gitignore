@@ -35,3 +35,45 @@ datasets/vg/
 # MacOS
 .DS_Store
 
+# ==== Large files / artifacts ====
+# checkpoints & weights
+checkpoints/
+weights/
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.pt
+*.pkl
+
+# datasets
+data/
+datasets/
+
+# training outputs / logs
+runs/
+logs/
+output/
+*.log
+
+# virtual env
+venv/
+.venv/
+
+# archives
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# common large binary formats
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.tfrecord
+
+# large local embeddings / artifacts
+glove/
+glove.*
+*.200d

@@ -9,7 +9,7 @@ import torch
 from maskrcnn_benchmark.image_retrieval.evaluation import run_evaluation
 from maskrcnn_benchmark.image_retrieval.modelv2 import SGEncode
 from maskrcnn_benchmark.image_retrieval.dataloader import get_loader
-from maskrcnn_benchmark.config import cfg
+from maskrcnn_benchmark.config import cfg, coerce_yacs_cli_opts
 from maskrcnn_benchmark.solver import make_lr_scheduler
 from maskrcnn_benchmark.solver import make_optimizer
 from maskrcnn_benchmark.utils.collect_env import collect_env_info
@@ -18,12 +18,7 @@ from maskrcnn_benchmark.utils.logger import setup_logger, debug_print
 from maskrcnn_benchmark.utils.miscellaneous import mkdir, save_config
 from tools.image_retrieval_main import get_dataset, run_test
 import numpy as np
-# See if we can use apex.DistributedDataParallel instead of the torch default,
-# and enable mixed-precision via apex.amp
-try:
-    from apex import amp
-except ImportError:
-    raise ImportError('Use APEX for multi-precision via apex.amp')
+from maskrcnn_benchmark.utils.amp_compat import amp
 
 # Do Not set it above 5000, otherwise you will start to run tests on the validation data...
 GALLERY_SIZE = 150
@@ -114,7 +109,7 @@ def main():
         synchronize()
 
     cfg.merge_from_file(args.config_file)
-    cfg.merge_from_list(args.opts)
+    cfg.merge_from_list(coerce_yacs_cli_opts(args.opts))
     cfg.freeze()
 
     output_dir = cfg.OUTPUT_DIR

@@ -1,15 +1,18 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 import os
+import re
 import sys
+from urllib.parse import urlparse
 
 try:
-    from torch.hub import _download_url_to_file
-    from torch.hub import urlparse
-    from torch.hub import HASH_REGEX
+    from torch.hub import download_url_to_file as _download_url_to_file
 except ImportError:
-    from torch.utils.model_zoo import _download_url_to_file
-    from torch.utils.model_zoo import urlparse
-    from torch.utils.model_zoo import HASH_REGEX
+    try:
+        from torch.utils.model_zoo import download_url_to_file as _download_url_to_file
+    except ImportError:
+        from torch.utils.model_zoo import _download_url_to_file
+
+HASH_REGEX = re.compile(r"-([a-f0-9]*)\\.")
 
 from maskrcnn_benchmark.utils.comm import is_main_process
 from maskrcnn_benchmark.utils.comm import synchronize

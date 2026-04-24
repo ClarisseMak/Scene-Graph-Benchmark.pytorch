@@ -58,7 +58,19 @@ def align_and_update_state_dicts(model_state_dict, loaded_state_dict, load_mappi
             continue
         key = current_keys[idx_new]
         key_old = loaded_keys[idx_old]
-        model_state_dict[key] = loaded_state_dict[key_old]
+        cur_t = model_state_dict[key]
+        load_t = loaded_state_dict[key_old]
+        if cur_t.shape != load_t.shape:
+            logger.info(
+                "SKIP load (shape mismatch): {} current {} vs checkpoint {} <- {}".format(
+                    key,
+                    tuple(cur_t.shape),
+                    tuple(load_t.shape),
+                    key_old,
+                )
+            )
+            continue
+        model_state_dict[key] = load_t
         # add a control gate for this logger (it's too large)
         if ((not key.startswith('module.'))  and key != key_old) or (key.startswith('module.') and key[7:] != key_old):
             logger.info(
@@ -67,7 +79,7 @@ def align_and_update_state_dicts(model_state_dict, loaded_state_dict, load_mappi
                     max_size,
                     key_old,
                     max_size_loaded,
-                    tuple(loaded_state_dict[key_old].shape),
+                    tuple(load_t.shape),
                 )
             )
 

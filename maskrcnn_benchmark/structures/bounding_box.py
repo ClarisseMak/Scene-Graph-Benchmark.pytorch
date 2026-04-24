@@ -36,13 +36,17 @@ class BoxList(object):
         self.mode = mode
         self.extra_fields = {}
         self.triplet_extra_fields = []  # e.g. relation field, which is not the same size as object bboxes and should not respond to __getitem__ slicing v[item]
+        # Image-level scalars (e.g. style_label): not per-box; copy as-is on slice/resize/crop
+        self.image_level_fields = set()
 
-    def add_field(self, field, field_data, is_triplet=False):
+    def add_field(self, field, field_data, is_triplet=False, is_image_level=False):
         # if field in self.extra_fields:
         #     print('{} is already in extra_fields. Try to replace with new data. '.format(field))
         self.extra_fields[field] = field_data
         if is_triplet:
             self.triplet_extra_fields.append(field)
+        if is_image_level:
+            self.image_level_fields.add(field)
 
     def get_field(self, field):
         return self.extra_fields[field]
@@ -56,6 +60,8 @@ class BoxList(object):
     def _copy_extra_fields(self, bbox):
         for k, v in bbox.extra_fields.items():
             self.extra_fields[k] = v
+        self.triplet_extra_fields = list(bbox.triplet_extra_fields)
+        self.image_level_fields = set(bbox.image_level_fields)
 
     def convert(self, mode):
         if mode not in ("xyxy", "xywh"):
@@ -112,6 +118,8 @@ class BoxList(object):
                     v = v.resize(size, *args, **kwargs)
                 if k in self.triplet_extra_fields:
                     bbox.add_field(k, v, is_triplet=True)
+                elif k in self.image_level_fields:
+                    bbox.add_field(k, v, is_image_level=True)
                 else:
                     bbox.add_field(k, v)
             return bbox
@@ -132,6 +140,8 @@ class BoxList(object):
                 v = v.resize(size, *args, **kwargs)
             if k in self.triplet_extra_fields:
                 bbox.add_field(k, v, is_triplet=True)
+            elif k in self.image_level_fields:
+                bbox.add_field(k, v, is_image_level=True)
             else:
                 bbox.add_field(k, v)
 
@@ -174,6 +184,8 @@ class BoxList(object):
                 v = v.transpose(method)
             if k in self.triplet_extra_fields:
                 bbox.add_field(k, v, is_triplet=True)
+            elif k in self.image_level_fields:
+                bbox.add_field(k, v, is_image_level=True)
             else:
                 bbox.add_field(k, v)
         return bbox.convert(self.mode)
@@ -205,6 +217,8 @@ class BoxList(object):
                 v = v.crop(box)
             if k in self.triplet_extra_fields:
                 bbox.add_field(k, v, is_triplet=True)
+            elif k in self.image_level_fields:
+                bbox.add_field(k, v, is_image_level=True)
             else:
                 bbox.add_field(k, v)
         return bbox.convert(self.mode)
@@ -218,6 +232,8 @@ class BoxList(object):
                 v = v.to(device)
             if k in self.triplet_extra_fields:
                 bbox.add_field(k, v, is_triplet=True)
+            elif k in self.image_level_fields:
+                bbox.add_field(k, v, is_image_level=True)
             else:
                 bbox.add_field(k, v)
         return bbox
@@ -227,6 +243,8 @@ class BoxList(object):
         for k, v in self.extra_fields.items():
             if k in self.triplet_extra_fields:
                 bbox.add_field(k, v[item][:,item], is_triplet=True)
+            elif k in self.image_level_fields:
+                bbox.add_field(k, v, is_image_level=True)
             else:
                 bbox.add_field(k, v[item])
         return bbox
@@ -269,6 +287,8 @@ class BoxList(object):
             if self.has_field(field):
                 if field in self.triplet_extra_fields:
                     bbox.add_field(field, self.get_field(field), is_triplet=True)
+                elif field in self.image_level_fields:
+                    bbox.add_field(field, self.get_field(field), is_image_level=True)
                 else:
                     bbox.add_field(field, self.get_field(field))
             elif not skip_missing:
