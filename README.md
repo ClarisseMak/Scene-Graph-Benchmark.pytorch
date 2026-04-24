@@ -281,3 +281,15 @@ note = {\url{https://github.com/KaihuaTang/Scene-Graph-Benchmark.pytorch}},
   year={2020}
 }
 ```
+
+## Project-Specific Updates (Fashion Context & Style Recognition)
+
+The repository has been extended with a fashion-oriented context/style recognition workflow on top of the original SGG pipeline. The key changes include:
+
+- Added fashion style label resources and dataset hooks to support style-aware data loading and metadata processing (e.g., style tags, fashion predicates, and related dataset wiring).
+- Extended relation modeling, training, and inference paths to include fashion-context signals and style-related supervision.
+- Added style evaluation and analysis utilities for ablation and reporting, including scripts for style metric computation, confusion matrix generation, style distribution audit, and result aggregation.
+- Added a dedicated fashion fine-tuning config (`configs/e2e_relation_fashion_finetune_R101_3060.yaml`) and related command-line/config handling improvements for easier experiment control.
+- Improved environment/runtime compatibility in this branch (AMP compatibility utilities and CLI option helpers) to make training and evaluation more robust on the current setup.
+
+These updates are intended to make the codebase usable for both standard scene graph generation and fashion-context style recognition experiments in a single workflow.
